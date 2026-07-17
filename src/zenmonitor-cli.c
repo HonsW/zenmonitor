@@ -315,6 +315,13 @@ int main(int argc, char *argv[]) {
     write_csv = (strcmp(file, "") != 0);
     sensor_filter = str_filter_parse(sensor_spec);
 
+    // Guard against a zero/negative interval: 0 would busy-loop, and a
+    // negative value wraps through the usleep() and window-math casts.
+    if (delay < 0.05) {
+        fprintf(stderr, "zenmonitor-cli: --delay too small, using 0.05s\n");
+        delay = 0.05;
+    }
+
     // Handle Ctrl-C/termination ourselves so ncurses is torn down, the CSV is
     // written, and the daemon snapshot is cleaned up.
     signal(SIGINT, request_stop);

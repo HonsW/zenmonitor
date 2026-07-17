@@ -33,6 +33,8 @@ Alternatively, you can set capabilities to zenmonitor executable: `sudo setcap c
 
 ``--coreid`` - Display core_id instead of core index
 
+``--interval MS`` - Initial refresh interval in milliseconds (50-60000, default 1000). The interval is also adjustable while running via the "Update interval" button in the header bar; changing it resets the rolling averages.
+
 ``--average WINDOWS`` - Show additional rolling-average columns for the given comma-separated time windows, e.g. ``--average 30s,1m,5m`` (suffixes: ``s`` seconds, ``m`` minutes, ``h`` hours; a bare number is seconds). Omit to show no average columns.
 
 ``--average-only SUBSTRINGS`` - Only average sensors whose label contains one of these comma-separated substrings (case-insensitive), e.g. ``--average-only power,temp``. Non-matching rows still show Value/Min/Max but leave the average cells blank. Omit to average every sensor.
@@ -106,11 +108,9 @@ sudo modprobe msr
 sudo bash -c 'echo "msr" > /etc/modules-load.d/msr.conf'
 sudo apt install build-essential libgtk-3-dev git
 cd ~
-git clone https://github.com/ocerman/zenmonitor
+git clone https://github.com/HonsW/zenmonitor
 cd zenmonitor
 make
 sudo make install
 sudo make install-polkit
 ```
-## Setup on Arch
-You may use the AUR package [zenmonitor-git](https://aur.archlinux.org/packages/zenmonitor-git/) to install via [traditional method](https://wiki.archlinux.org/index.php/Arch_User_Repository) or using an AUR helper (like yay)

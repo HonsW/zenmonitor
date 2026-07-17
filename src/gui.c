@@ -3,9 +3,13 @@
 #include "zenmonitor.h"
 #include "gui.h"
 
-// Sensor refresh cadence. Used both for the GTK timer and to translate the
-// configured average windows (in seconds) into a number of samples.
-#define REFRESH_INTERVAL_MS 200
+// Default sensor refresh cadence (ms). Overridable at startup via --interval
+// and at runtime via the "Update Interval" dialog. The interval also converts
+// the configured average windows (seconds) into a sample count, so changing it
+// re-parses the windows and resets the average history.
+#define DEFAULT_INTERVAL_MS 1000
+#define MIN_INTERVAL_MS 50
+#define MAX_INTERVAL_MS 60000
 
 GtkWidget *window;
 
@@ -23,23 +27,42 @@ static const guint defaultHeight = 350;
 #define COLUMN_MAX      4
 #define COLUMN_AVG_BASE 5
 
+// Current refresh cadence in ms (settable via --interval and the dialog).
+static guint refresh_interval_ms = DEFAULT_INTERVAL_MS;
+
 // Rolling-average configuration (count == 0 by default -> no average columns).
 static AvgWindows *avg = NULL;
 static AvgSeries *series = NULL;   // one per tree row
 static gboolean *row_avg = NULL;   // whether each row is averaged (--average-only)
 static gchar **avg_filter = NULL;  // NULL => average every sensor
+static gchar *avg_spec = NULL;     // retained window spec, re-parsed on interval change
 static guint n_rows = 0;
 
 static guint avg_count(void) {
     return avg ? avg->count : 0;
 }
 
-// Parse a comma-separated list of window durations (e.g. "30s,1m,5m").
-// Passing NULL or an empty string leaves averaging disabled.
-void gui_set_averages(const gchar *spec) {
+// (Re)build the average windows from the retained spec and current interval.
+static void parse_averages(void) {
     if (avg)
         avg_windows_free(avg);
-    avg = avg_windows_parse(spec, REFRESH_INTERVAL_MS);
+    avg = avg_windows_parse(avg_spec, refresh_interval_ms);
+}
+
+// Set the initial refresh interval (clamped). Called before start_gui().
+void gui_set_interval(guint ms) {
+    if (ms < MIN_INTERVAL_MS)
+        ms = MIN_INTERVAL_MS;
+    if (ms > MAX_INTERVAL_MS)
+        ms = MAX_INTERVAL_MS;
+    refresh_interval_ms = ms;
+}
+
+// Retain the window spec (e.g. "30s,1m,5m"); parsing happens in start_gui once
+// the interval is known. NULL/empty leaves averaging disabled.
+void gui_set_averages(const gchar *spec) {
+    g_free(avg_spec);
+    avg_spec = (spec && *spec) ? g_strdup(spec) : NULL;
 }
 
 // Restrict which sensors get averaged to those whose label contains one of the
@@ -241,6 +264,72 @@ static void clear_btn_clicked(GtkButton *button, gpointer user_data) {
     }
 }
 
+// Re-parse the average windows for the new interval and reset every averaged
+// row's history (samples taken at different cadences can't share a window).
+static void reset_averages(void) {
+    GtkTreeIter iter;
+    guint r = 0, k;
+
+    if (avg_count() == 0)
+        return;
+
+    parse_averages();
+
+    if (!series || !gtk_tree_model_get_iter_first(model, &iter))
+        return;
+
+    do {
+        if (r < n_rows && row_avg[r]) {
+            avg_series_free(&series[r]);
+            avg_series_init(&series[r], avg);
+            for (k = 0; k < avg->count; k++)
+                gtk_list_store_set(GTK_LIST_STORE(model), &iter,
+                                   COLUMN_AVG_BASE + k, " --- ", -1);
+        }
+        r++;
+    } while (gtk_tree_model_iter_next(model, &iter));
+}
+
+static void apply_interval(guint ms) {
+    if (ms == refresh_interval_ms)
+        return;
+
+    refresh_interval_ms = ms;
+    reset_averages();       // rescale windows and restart the average history
+
+    // Reschedule only if monitoring is actually running (timeout is 0 when no
+    // Zen CPU was detected and sensors were never initialised).
+    if (timeout) {
+        g_source_remove(timeout);
+        timeout = g_timeout_add(refresh_interval_ms, update_data, NULL);
+    }
+}
+
+static void interval_btn_clicked(GtkButton *button, gpointer user_data) {
+    GtkWidget *dialog, *content, *box, *label, *spin;
+
+    dialog = gtk_dialog_new_with_buttons("Update Interval", GTK_WINDOW(window),
+                                         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                         "_Cancel", GTK_RESPONSE_CANCEL,
+                                         "_OK", GTK_RESPONSE_OK, NULL);
+    content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+
+    box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+    label = gtk_label_new("Update interval (ms):");
+    spin = gtk_spin_button_new_with_range(MIN_INTERVAL_MS, MAX_INTERVAL_MS, 50);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), refresh_interval_ms);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), spin, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(content), box);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK)
+        apply_interval((guint)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin)));
+
+    gtk_widget_destroy(dialog);
+}
+
 static gboolean mid_search_eq_func(GtkTreeModel *model, gint column, const gchar *key, GtkTreeIter *iter) {
     gchar *iter_string = NULL, *lc_iter_string = NULL, *lc_key = NULL;
     gboolean result;
@@ -279,6 +368,7 @@ static void resize_to_treeview(GtkWindow* window, GtkTreeView* treeview) {
 int start_gui (SensorSource *ss) {
     GtkWidget *about_btn;
     GtkWidget *clear_btn;
+    GtkWidget *interval_btn;
     GtkWidget *box;
     GtkWidget *header;
     GtkWidget *treeview;
@@ -312,9 +402,15 @@ int start_gui (SensorSource *ss) {
     gtk_container_add(GTK_CONTAINER(box), clear_btn);
     gtk_widget_set_tooltip_text(clear_btn, "Clear Min/Max");
 
+    interval_btn = gtk_button_new();
+    gtk_container_add(GTK_CONTAINER(interval_btn), gtk_image_new_from_icon_name("preferences-system", GTK_ICON_SIZE_BUTTON));
+    gtk_container_add(GTK_CONTAINER(box), interval_btn);
+    gtk_widget_set_tooltip_text(interval_btn, "Update interval");
+
     gtk_header_bar_pack_start(GTK_HEADER_BAR(header), box);
     g_signal_connect(about_btn, "clicked", G_CALLBACK(about_btn_clicked), NULL);
     g_signal_connect(clear_btn, "clicked", G_CALLBACK(clear_btn_clicked), NULL);
+    g_signal_connect(interval_btn, "clicked", G_CALLBACK(interval_btn_clicked), NULL);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
     vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -325,6 +421,7 @@ int start_gui (SensorSource *ss) {
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW (sw), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_box_pack_start(GTK_BOX (vbox), sw, TRUE, TRUE, 0);
 
+    parse_averages();   // build windows from the spec + initial interval
     model = create_model();
     treeview = gtk_tree_view_new_with_model(model);
     gtk_tree_view_set_tooltip_column(GTK_TREE_VIEW(treeview), COLUMN_HINT);
@@ -344,7 +441,7 @@ int start_gui (SensorSource *ss) {
         init_sensors();
 
         resize_to_treeview(GTK_WINDOW(window), GTK_TREE_VIEW(treeview));
-        timeout = g_timeout_add(REFRESH_INTERVAL_MS, update_data, NULL);
+        timeout = g_timeout_add(refresh_interval_ms, update_data, NULL);
     }
     else{
         dialog = gtk_message_dialog_new(GTK_WINDOW (window),

@@ -28,12 +28,14 @@ static SensorSource sensor_sources[] = {
 };
 
 gboolean display_coreid = 0;
+static gint interval_ms = 1000;
 static gchar *average_spec = NULL;
 static gchar *average_only_spec = NULL;
 
 static GOptionEntry options[] =
 {
     { "coreid", 'c', 0, G_OPTION_ARG_NONE, &display_coreid, "Display core_id instead of core index", NULL },
+    { "interval", 'i', 0, G_OPTION_ARG_INT, &interval_ms, "Initial refresh interval in ms (50-60000, default 1000; adjustable at runtime)", "MS" },
     { "average", 'a', 0, G_OPTION_ARG_STRING, &average_spec, "Show rolling-average columns for the given comma-separated windows (e.g. 30s,1m,5m)", "WINDOWS" },
     { "average-only", 'A', 0, G_OPTION_ARG_STRING, &average_only_spec, "Only average sensors whose label contains one of these comma-separated substrings (e.g. power,temp)", "SUBSTRINGS" },
     { NULL }
@@ -52,6 +54,8 @@ int main (int argc, char *argv[])
         exit (1);
     }
 
+    // A negative value must clamp to the minimum, not wrap around the cast.
+    gui_set_interval(interval_ms > 0 ? (guint)interval_ms : 0);
     gui_set_averages(average_spec);
     gui_set_average_filter(average_only_spec);
     start_gui(sensor_sources);
