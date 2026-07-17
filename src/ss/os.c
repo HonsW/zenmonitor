@@ -11,9 +11,9 @@ static gchar **frq_files = NULL;
 static guint cores;
 static struct cpudev *cpu_dev_ids;
 
-gfloat *core_freq;
-gfloat *core_freq_min;
-gfloat *core_freq_max;
+static gfloat *core_freq;
+static gfloat *core_freq_min;
+static gfloat *core_freq_max;
 
 static gdouble get_frequency(guint corei) {
     gchar *data;

@@ -33,15 +33,15 @@ static gulong package_eng_a = 0;
 static gulong *core_eng_b = NULL;
 static gulong *core_eng_a = NULL;
 
-gfloat package_power;
-gfloat package_power_min;
-gfloat package_power_max;
-gfloat *core_power;
-gfloat *core_fid;
-gfloat *core_power_min;
-gfloat *core_power_max;
-gfloat *core_fid_min;
-gfloat *core_fid_max;
+static gfloat package_power;
+static gfloat package_power_min;
+static gfloat package_power_max;
+static gfloat *core_power;
+static gfloat *core_fid;
+static gfloat *core_power_min;
+static gfloat *core_power_max;
+static gfloat *core_fid_min;
+static gfloat *core_fid_max;
 
 
 static gint open_msr(gshort devid) {

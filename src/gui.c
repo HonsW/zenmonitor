@@ -181,11 +181,17 @@ static gboolean update_data (gpointer data) {
     const SensorInit *sensorData;
     guint row = 0;
 
-    if (model == NULL)
+    // On self-removal, clear the stored ID so apply_interval() won't
+    // g_source_remove() a source that no longer exists.
+    if (model == NULL) {
+        timeout = 0;
         return G_SOURCE_REMOVE;
+    }
 
-    if (!gtk_tree_model_get_iter_first (model, &iter))
+    if (!gtk_tree_model_get_iter_first (model, &iter)) {
+        timeout = 0;
         return G_SOURCE_REMOVE;
+    }
 
     for (source = sensor_sources; source->drv; source++) {
         if (!source->enabled)
@@ -238,7 +244,7 @@ static void add_columns (GtkTreeView *treeview) {
 
 static void about_btn_clicked(GtkButton *button, gpointer user_data) {
     GtkWidget *dialog;
-    const gchar *website = "https://github.com/ocerman/zenmonitor";
+    const gchar *website = "https://github.com/HonsW/zenmonitor";
     const gchar *msg = "<b>Zen Monitor</b> %s\n"
                        "Monitoring software for AMD Zen-based CPUs\n"
                        "<a href=\"%s\">%s</a>\n\n"

@@ -4,7 +4,7 @@
 #include "zenmonitor.h"
 #include "zenpower.h"
 
-GSList *zp_sensors = NULL;
+static GSList *zp_sensors = NULL;
 static int nodes = 0;
 
 typedef struct
