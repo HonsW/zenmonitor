@@ -1,7 +1,6 @@
 #ifndef __ZENMONITOR_ZENMONITOR_H__
 #define __ZENMONITOR_ZENMONITOR_H__
 
-#include <time.h>
 #include <glib.h>
 
 #define ERROR_VALUE -999.0
@@ -28,12 +27,6 @@ typedef struct {
     GSList *sensors;
 } SensorSource;
 
-typedef struct {
-    GPtrArray *labels;
-    GPtrArray *data;
-    GArray *time;
-} SensorDataStore;
-
 // Rolling-average configuration, shared by the GUI columns and the CLI daemon.
 typedef struct {
     gchar **titles;   // count entries: column/label heading, e.g. "Avg 1m"
@@ -56,13 +49,6 @@ void sensor_init_free(SensorInit *s);
 gboolean check_zen(void);
 gchar *cpu_model(void);
 guint get_core_count(void);
-
-SensorDataStore* sensor_data_store_new(void);
-void sensor_data_store_add_entry(SensorDataStore *store, gchar *entry);
-gint sensor_data_store_drop_entry(SensorDataStore *store, gchar *entry);
-void sensor_data_store_keep_time(SensorDataStore *store);
-gint sensor_data_store_add_data(SensorDataStore *store, gchar *entry, float data);
-void sensor_data_store_free(SensorDataStore *store);
 
 AvgWindows* avg_windows_parse(const gchar *spec, guint interval_ms);
 void avg_windows_free(AvgWindows *w);

@@ -22,12 +22,13 @@ static gint refresh_in_place = 0;
 static gint output_once = 0;
 static gint daemon_mode = 0;
 
-static SensorDataStore *store;
+static FILE *csv = NULL;          // streaming CSV log (--file), NULL when off
+static guint n_selected = 0;      // sensors passing the --sensors filter
 static volatile sig_atomic_t stop_requested = 0;
 
 static GOptionEntry options[] = {
     {"file", 'f', G_OPTION_FLAG_NONE, G_OPTION_ARG_STRING, &file,
-     "Output collected readings to a CSV file on exit", "FILE"},
+     "Append readings to a CSV file (one row per refresh, crash-safe)", "FILE"},
     {"delay", 'd', G_OPTION_FLAG_NONE, G_OPTION_ARG_DOUBLE, &delay,
      "Interval between refreshes in seconds (default 0.5)", "SECONDS"},
     {"coreid", 'c', 0, G_OPTION_ARG_NONE, &display_coreid,
@@ -67,45 +68,11 @@ static SensorSource sensor_sources[] = {
     }
 };
 
-// Async-signal-safe: just request a clean shutdown. The actual CSV flush,
-// snapshot removal, and ncurses teardown happen back in the main loop.
+// Async-signal-safe: just request a clean shutdown. The ncurses teardown,
+// CSV close, and daemon snapshot removal happen back in the main loop.
 static void request_stop(int signum) {
     (void)signum;
     stop_requested = 1;
-}
-
-static void flush_to_csv(const gchar *path) {
-    FILE *csv;
-    guint sensors, samples, s, t;
-
-    csv = fopen(path, "w");
-    if (!csv) {
-        fprintf(stderr, "zenmonitor-cli: cannot open '%s': %s\n",
-                path, g_strerror(errno));
-        return;
-    }
-
-    sensors = store->labels->len;
-    samples = store->time->len;
-
-    fprintf(csv, "time(epoch)");
-    for (s = 0; s < sensors; s++)
-        fprintf(csv, ",%s", (gchar *)g_ptr_array_index(store->labels, s));
-    fprintf(csv, "\n");
-
-    for (t = 0; t < samples; t++) {
-        struct timespec ts = g_array_index(store->time, struct timespec, t);
-        fprintf(csv, "%ld.%.9ld", (long)ts.tv_sec, (long)ts.tv_nsec);
-
-        for (s = 0; s < sensors; s++) {
-            GArray *data = g_ptr_array_index(store->data, s);
-            float value = (t < data->len) ? g_array_index(data, float, t) : 0.0f;
-            fprintf(csv, ",%f", value);
-        }
-        fprintf(csv, "\n");
-    }
-
-    fclose(csv);
 }
 
 #define sensor_selected(label) str_filter_match(sensor_filter, (label))
@@ -123,18 +90,49 @@ static void init_sensors(void) {
                 sensor = source->sensors;
                 while (sensor) {
                     data = (SensorInit *)sensor->data;
-                    if (sensor_selected(data->label)) {
-                        sensor_data_store_add_entry(store, data->label);
+                    if (sensor_selected(data->label))
                         selected++;
-                    }
                     sensor = sensor->next;
                 }
                 // Skip the whole source at update time when nothing matched,
                 // avoiding its per-tick sensor reads (e.g. the MSR preads).
                 source->enabled = (selected > 0);
+                n_selected += selected;
             }
         }
     }
+}
+
+// Open the CSV log and write the header. Rows are appended one per refresh in
+// update_data() and flushed immediately, so the file is valid mid-run
+// (tail -f works) and survives a crash up to the last row - unlike the old
+// dump-at-exit design, which also held every sample in memory.
+static gboolean csv_open(const gchar *path) {
+    SensorSource *source;
+    GSList *node;
+    const SensorInit *data;
+
+    csv = fopen(path, "w");
+    if (!csv) {
+        fprintf(stderr, "zenmonitor-cli: cannot open '%s': %s\n",
+                path, g_strerror(errno));
+        return FALSE;
+    }
+
+    // Column order matches the iteration order used in update_data().
+    fprintf(csv, "time(epoch)");
+    for (source = sensor_sources; source->drv; source++) {
+        if (!source->enabled)
+            continue;
+        for (node = source->sensors; node; node = node->next) {
+            data = (SensorInit *)node->data;
+            if (sensor_selected(data->label))
+                fprintf(csv, ",%s", data->label);
+        }
+    }
+    fprintf(csv, "\n");
+    fflush(csv);
+    return TRUE;
 }
 
 static void update_data(void) {
@@ -143,7 +141,11 @@ static void update_data(void) {
     const SensorInit *sensorData;
     int row = 1; // ncurses uses 1-based row indexing
 
-    sensor_data_store_keep_time(store);
+    if (csv) {
+        struct timespec ts;
+        timespec_get(&ts, TIME_UTC);
+        fprintf(csv, "%ld.%.9ld", (long)ts.tv_sec, (long)ts.tv_nsec);
+    }
 
     for (source = sensor_sources; source->drv; source++) {
         if (!source->enabled)
@@ -160,7 +162,8 @@ static void update_data(void) {
                 node = node->next;
                 continue;
             }
-            sensor_data_store_add_data(store, sensorData->label, *sensorData->value);
+            if (csv)
+                fprintf(csv, ",%f", *sensorData->value);
 
             if (refresh_in_place) {
                 mvprintw(row++, 0, "%s\t%f", sensorData->label, *sensorData->value);
@@ -169,6 +172,11 @@ static void update_data(void) {
             }
             node = node->next;
         }
+    }
+
+    if (csv) {
+        fprintf(csv, "\n");
+        fflush(csv);
     }
 
     if (refresh_in_place)
@@ -274,7 +282,7 @@ static int run_daemon(void) {
     interval_ms = (guint)(delay * 1000.0 + 0.5);
     avg = avg_windows_parse(average_spec, interval_ms);
 
-    n_sensors = store->labels->len;
+    n_sensors = n_selected;
     series = g_new0(AvgSeries, n_sensors ? n_sensors : 1);
     for (i = 0; i < n_sensors; i++)
         avg_series_init(&series[i], avg);
@@ -323,18 +331,23 @@ int main(int argc, char *argv[]) {
     }
 
     // Handle Ctrl-C/termination ourselves so ncurses is torn down, the CSV is
-    // written, and the daemon snapshot is cleaned up.
+    // closed, and the daemon snapshot is cleaned up.
     signal(SIGINT, request_stop);
     signal(SIGTERM, request_stop);
 
-    store = sensor_data_store_new();
     init_sensors();
 
     if (daemon_mode) {
+        if (write_csv)
+            fprintf(stderr, "zenmonitor-cli: --file is ignored in --daemon mode\n");
         ret = run_daemon();
-        sensor_data_store_free(store);
         return ret;
     }
+
+    // Fail fast if the log can't be opened, instead of sampling for hours and
+    // discovering it at exit.
+    if (write_csv && !csv_open(file))
+        return EXIT_FAILURE;
 
     if (refresh_in_place) {
         initscr();
@@ -346,9 +359,8 @@ int main(int argc, char *argv[]) {
     if (refresh_in_place)
         endwin();
 
-    if (write_csv)
-        flush_to_csv(file);
+    if (csv)
+        fclose(csv);
 
-    sensor_data_store_free(store);
     return EXIT_SUCCESS;
 }

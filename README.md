@@ -47,7 +47,10 @@ sudo make install-cli
 ```
 It reuses the same sensor backends and supports ``--delay SECONDS`` (poll
 interval), ``--coreid``, ``--refresh-in-place`` (redraw in place), ``--output-once``,
-and ``--file FILE`` (dump all collected readings to CSV on exit).
+and ``--file FILE`` (stream readings to a CSV file, one row per refresh). The CSV
+is appended and flushed as it goes, so memory use stays constant, ``tail -f``
+works on it, and the log survives up to the last row if the machine crashes -
+which makes it suitable for long high-frequency captures.
 
 ``--sensors SUBSTRINGS`` limits output to sensors whose label contains one of the
 given comma-separated substrings (case-insensitive), e.g.
