@@ -33,6 +33,55 @@ Alternatively, you can set capabilities to zenmonitor executable: `sudo setcap c
 
 ``--coreid`` - Display core_id instead of core index
 
+``--average WINDOWS`` - Show additional rolling-average columns for the given comma-separated time windows, e.g. ``--average 30s,1m,5m`` (suffixes: ``s`` seconds, ``m`` minutes, ``h`` hours; a bare number is seconds). Omit to show no average columns.
+
+``--average-only SUBSTRINGS`` - Only average sensors whose label contains one of these comma-separated substrings (case-insensitive), e.g. ``--average-only power,temp``. Non-matching rows still show Value/Min/Max but leave the average cells blank. Omit to average every sensor.
+
+## Command line interface (zenmonitor-cli)
+A headless build is available for terminals and panels:
+```
+make build-cli
+sudo make install-cli
+```
+It reuses the same sensor backends and supports ``--delay SECONDS`` (poll
+interval), ``--coreid``, ``--refresh-in-place`` (redraw in place), ``--output-once``,
+and ``--file FILE`` (dump all collected readings to CSV on exit).
+
+``--sensors SUBSTRINGS`` limits output to sensors whose label contains one of the
+given comma-separated substrings (case-insensitive), e.g.
+``--sensors "temperature,package power"``. Besides trimming the output and the
+per-sensor average buffers, if a whole backend has no matching sensors its
+per-tick read is skipped entirely (handy to avoid the MSR reads when you only
+want temperatures).
+
+### Rolling averages in a panel (daemon mode)
+A rolling average needs a process that has been sampling for the whole window,
+so short-lived panel commands can't compute one on their own. Run zenmonitor-cli
+as a small resident daemon instead:
+```
+zenmonitor-cli --daemon --delay 1 --average 1m,5m
+```
+It samples every ``--delay`` seconds and rewrites a snapshot file (default
+``$XDG_RUNTIME_DIR/zenmonitor.snapshot``, override with ``--snapshot FILE``)
+containing each sensor's current value and the configured rolling averages.
+The window→sample conversion follows ``--delay``, so ``5m`` is five minutes at
+any poll rate.
+
+``data/zenmonitor-cli.service`` is an example systemd *user* unit that keeps the
+daemon running. ``data/zenmonitor-genmon.sh`` reads the snapshot for the
+[xfce4-genmon-plugin](https://docs.xfce.org/panel-plugins/xfce4-genmon-plugin);
+point a genmon item at, for example:
+```
+zenmonitor-genmon.sh "CPU Temperature (tCtl)" "Avg 1m"
+```
+
+Note: temperature/SVI2 sensors (via the zenpower driver) work as a normal user,
+but RAPL package/core power needs MSR privileges. To include power in the daemon
+snapshot, grant capabilities to the binary:
+```
+sudo setcap cap_sys_rawio,cap_dac_read_search+ep /usr/local/bin/zenmonitor-cli
+```
+
 ## Installing
 By default, Zenmonitor will be installed to /usr/local.
 ```

@@ -12,7 +12,6 @@
 
 #define MSR_PWR_PRINTF_FORMAT " %8.3f W"
 #define MSR_FID_PRINTF_FORMAT " %8.3f GHz"
-#define MESUREMENT_TIME 0.1
 
 // AMD PPR  = https://www.amd.com/system/files/TechDocs/54945_PPR_Family_17h_Models_00h-0Fh.pdf
 // AMD OSRR = https://developer.amd.com/wp-content/resources/56255_3_03.PDF
@@ -20,6 +19,12 @@
 static guint cores = 0;
 static gdouble energy_unit = 0;
 static struct cpudev *cpu_dev_ids;
+
+// Monotonic timestamp (microseconds) of the previous sample. RAPL energy is a
+// running counter, so power is the energy delta divided by the real elapsed
+// time between samples. Measuring over the natural refresh interval avoids a
+// blocking sleep that would otherwise freeze the GTK main loop each tick.
+static gint64 last_sample_time = 0;
 
 static gint *msr_files = NULL;
 
@@ -40,8 +45,8 @@ gfloat *core_fid_max;
 
 
 static gint open_msr(gshort devid) {
-    gchar msr_path[20];
-    sprintf(msr_path, "/dev/cpu/%d/msr", devid);
+    gchar msr_path[32];
+    snprintf(msr_path, sizeof msr_path, "/dev/cpu/%d/msr", devid);
     return open(msr_path, O_RDONLY);
 }
 
@@ -81,7 +86,7 @@ gulong get_core_energy(gint core) {
 
 gdouble get_core_fid(gint core) {
     gdouble ratio;
-    gulong data;
+    gulong data, fdid;
 
     // By reverse-engineering Ryzen Master, we know that
     //  this undocumented MSR is responsible for returning
@@ -93,13 +98,17 @@ gdouble get_core_fid(gint core) {
     if (!read_msr(msr_files[core], 0xC0010293, &data))
         return 0;
 
-    ratio = (gdouble)(data & 0xff) / (gdouble)((data >> 8) & 0x3F);
+    fdid = (data >> 8) & 0x3F;
+    if (fdid == 0)
+        return 0;
+
+    ratio = (gdouble)(data & 0xff) / (gdouble)fdid;
 
     // The effective ratio is based on increments of 200 MHz.
     return ratio * 200.0 / 1000.0;
 }
 
-gboolean msr_init() {
+gboolean msr_init(void) {
     guint i;
 
     if (!check_zen())
@@ -110,7 +119,7 @@ gboolean msr_init() {
         return FALSE;
 
     cpu_dev_ids = get_cpu_dev_ids();
-    msr_files = malloc(cores * sizeof (gint));
+    msr_files = g_malloc(cores * sizeof (gint));
     for (i = 0; i < cores; i++) {
         msr_files[i] = open_msr(cpu_dev_ids[i].cpuid);
     }
@@ -119,16 +128,26 @@ gboolean msr_init() {
     if (energy_unit == 0)
         return FALSE;
 
-    core_eng_b = malloc(cores * sizeof (gulong));
-    core_eng_a = malloc(cores * sizeof (gulong));
-    core_power = malloc(cores * sizeof (gfloat));
-    core_fid = malloc(cores * sizeof (gfloat));
-    core_power_min = malloc(cores * sizeof (gfloat));
-    core_power_max = malloc(cores * sizeof (gfloat));
-    core_fid_min = malloc(cores * sizeof (gfloat));
-    core_fid_max = malloc(cores * sizeof (gfloat));
+    core_eng_b = g_malloc(cores * sizeof (gulong));
+    core_eng_a = g_malloc(cores * sizeof (gulong));
+    core_power = g_malloc(cores * sizeof (gfloat));
+    core_fid = g_malloc(cores * sizeof (gfloat));
+    core_power_min = g_malloc(cores * sizeof (gfloat));
+    core_power_max = g_malloc(cores * sizeof (gfloat));
+    core_fid_min = g_malloc(cores * sizeof (gfloat));
+    core_fid_max = g_malloc(cores * sizeof (gfloat));
 
-    msr_update();
+    // Establish the energy/time baseline. Power stays at 0 until the first
+    // timer-driven msr_update() computes it over the elapsed interval.
+    last_sample_time = g_get_monotonic_time();
+    package_eng_b = get_package_energy();
+    package_power = 0;
+    for (i = 0; i < cores; i++) {
+        core_eng_b[i] = get_core_energy(i);
+        core_power[i] = 0;
+        core_fid[i] = get_core_fid(i);
+    }
+
     memcpy(core_power_min, core_power, cores * sizeof (gfloat));
     memcpy(core_power_max, core_power, cores * sizeof (gfloat));
     memcpy(core_fid_min, core_fid, cores * sizeof (gfloat));
@@ -139,40 +158,45 @@ gboolean msr_init() {
     return TRUE;
 }
 
-void msr_update() {
+void msr_update(void) {
     guint i;
+    gint64 now;
+    gdouble elapsed;
 
-    package_eng_b = get_package_energy();
-    for (i = 0; i < cores; i++) {
-        core_eng_b[i] = get_core_energy(i);
-    }
-
-    usleep(MESUREMENT_TIME*1000000);
+    // Read the current energy counters and compute power over the time that
+    // has actually elapsed since the previous sample. No blocking sleep, so
+    // the GTK main loop stays responsive between refreshes.
+    now = g_get_monotonic_time();
+    elapsed = (now - last_sample_time) / 1000000.0;
 
     package_eng_a = get_package_energy();
     for (i = 0; i < cores; i++) {
         core_eng_a[i] = get_core_energy(i);
     }
 
-    if (package_eng_a >= package_eng_b) {
-        package_power = (package_eng_a - package_eng_b) * energy_unit / MESUREMENT_TIME;
+    if (elapsed > 0) {
+        if (package_eng_a >= package_eng_b) {
+            package_power = (package_eng_a - package_eng_b) * energy_unit / elapsed;
 
-        if (package_power < package_power_min)
-            package_power_min = package_power;
-        if (package_power > package_power_max)
-            package_power_max = package_power;
+            if (package_power < package_power_min)
+                package_power_min = package_power;
+            if (package_power > package_power_max)
+                package_power_max = package_power;
+        }
+
+        for (i = 0; i < cores; i++) {
+            if (core_eng_a[i] >= core_eng_b[i]) {
+                core_power[i] = (core_eng_a[i] - core_eng_b[i]) * energy_unit / elapsed;
+
+                if (core_power[i] < core_power_min[i])
+                    core_power_min[i] = core_power[i];
+                if (core_power[i] > core_power_max[i])
+                    core_power_max[i] = core_power[i];
+            }
+        }
     }
 
     for (i = 0; i < cores; i++) {
-        if (core_eng_a[i] >= core_eng_b[i]) {
-            core_power[i] = (core_eng_a[i] - core_eng_b[i]) * energy_unit / MESUREMENT_TIME;
-
-            if (core_power[i] < core_power_min[i])
-                core_power_min[i] = core_power[i];
-            if (core_power[i] > core_power_max[i])
-                core_power_max[i] = core_power[i];
-        }
-
         core_fid[i] = get_core_fid(i);
 
         if (core_fid[i] < core_fid_min[i])
@@ -180,9 +204,16 @@ void msr_update() {
         if (core_fid[i] > core_fid_max[i])
             core_fid_max[i] = core_fid[i];
     }
+
+    // Current counters become the baseline for the next interval.
+    package_eng_b = package_eng_a;
+    for (i = 0; i < cores; i++) {
+        core_eng_b[i] = core_eng_a[i];
+    }
+    last_sample_time = now;
 }
 
-void msr_clear_minmax() {
+void msr_clear_minmax(void) {
     guint i;
 
     package_power_min = package_power;
@@ -195,7 +226,7 @@ void msr_clear_minmax() {
     }
 }
 
-GSList* msr_get_sensors() {
+GSList* msr_get_sensors(void) {
     GSList *list = NULL;
     SensorInit *data;
     guint i;

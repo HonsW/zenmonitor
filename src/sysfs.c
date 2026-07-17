@@ -35,16 +35,16 @@ struct cpudev* get_cpu_dev_ids(void) {
     guint cores;
     gboolean found;
     struct bitset seen = { 0 };
-    int i;
+    guint i;
 
     cores = get_core_count();
-    cpu_dev_ids = malloc(cores * sizeof (*cpu_dev_ids));
+    cpu_dev_ids = g_malloc(cores * sizeof (*cpu_dev_ids));
     for (i=0;i<cores;i++)
         cpu_dev_ids[i] = (struct cpudev) { -1, -1 };
 
     dir = g_dir_open(SYSFS_DIR_CPUS, 0, NULL);
     if (dir) {
-        int i = 0;
+        guint n = 0;
 
         while ((entry = g_dir_read_name(dir))) {
             if (sscanf(entry, "cpu%hd", &cpuid) != 1) {
@@ -81,8 +81,8 @@ struct cpudev* get_cpu_dev_ids(void) {
                 }
             }
 
-            if (found && i < cores) {
-                cpu_dev_ids[i++] = (struct cpudev) { coreid, cpuid };
+            if (found && n < cores) {
+                cpu_dev_ids[n++] = (struct cpudev) { coreid, cpuid };
             }
 
             g_free(filename);

@@ -39,16 +39,16 @@ gboolean os_init(void) {
         return FALSE;
 
     cpu_dev_ids = get_cpu_dev_ids();
-    frq_files = malloc(cores * sizeof (gchar*));
+    frq_files = g_malloc(cores * sizeof (gchar*));
     for (i = 0; i < cores; i++) {
         frq_files[i] = g_strdup_printf(
                         "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",
                         cpu_dev_ids[i].cpuid);
     }
 
-    core_freq = malloc(cores * sizeof (gfloat));
-    core_freq_min = malloc(cores * sizeof (gfloat));
-    core_freq_max = malloc(cores * sizeof (gfloat));
+    core_freq = g_malloc(cores * sizeof (gfloat));
+    core_freq_min = g_malloc(cores * sizeof (gfloat));
+    core_freq_max = g_malloc(cores * sizeof (gfloat));
 
     os_update();
     memcpy(core_freq_min, core_freq, cores * sizeof (gfloat));

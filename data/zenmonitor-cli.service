@@ -1,0 +1,18 @@
+# Example systemd *user* service for the zenmonitor-cli snapshot daemon.
+# Install:  cp data/zenmonitor-cli.service ~/.config/systemd/user/
+#           systemctl --user enable --now zenmonitor-cli.service
+#
+# Note: SVI2/temperature sensors (zenpower) work as a normal user, but RAPL
+# package/core power comes from the MSR device and needs privileges. Grant them
+# to the binary if you want power in the snapshot:
+#   sudo setcap cap_sys_rawio,cap_dac_read_search+ep /usr/local/bin/zenmonitor-cli
+
+[Unit]
+Description=Zenmonitor CLI snapshot daemon (rolling averages for panels)
+
+[Service]
+ExecStart=/usr/local/bin/zenmonitor-cli --daemon --delay 1 --average 1m,5m
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
