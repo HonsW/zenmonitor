@@ -1,7 +1,15 @@
 #include <cpuid.h>
 #include <gtk/gtk.h>
-#include "gui.h"
 #include "zenmonitor.h"
+#include "gui.h"
+
+// Default sensor refresh cadence (ms). Overridable at startup via --interval
+// and at runtime via the "Update Interval" dialog. The interval also converts
+// the configured average windows (seconds) into a sample count, so changing it
+// re-parses the windows and resets the average history.
+#define DEFAULT_INTERVAL_MS 1000
+#define MIN_INTERVAL_MS 50
+#define MAX_INTERVAL_MS 60000
 
 GtkWidget *window;
 
@@ -10,14 +18,63 @@ static guint timeout = 0;
 static SensorSource *sensor_sources;
 static const guint defaultHeight = 350;
 
-enum {
-    COLUMN_NAME,
-    COLUMN_HINT,
-    COLUMN_VALUE,
-    COLUMN_MIN,
-    COLUMN_MAX,
-    NUM_COLUMNS
-};
+// Fixed columns; any configured rolling-average columns follow at
+// COLUMN_AVG_BASE .. COLUMN_AVG_BASE + avg->count - 1.
+#define COLUMN_NAME     0
+#define COLUMN_HINT     1
+#define COLUMN_VALUE    2
+#define COLUMN_MIN      3
+#define COLUMN_MAX      4
+#define COLUMN_AVG_BASE 5
+
+// Current refresh cadence in ms (settable via --interval and the dialog).
+static guint refresh_interval_ms = DEFAULT_INTERVAL_MS;
+
+// Rolling-average configuration (count == 0 by default -> no average columns).
+static AvgWindows *avg = NULL;
+static AvgSeries *series = NULL;   // one per tree row
+static gboolean *row_avg = NULL;   // whether each row is averaged (--average-only)
+static gchar **avg_filter = NULL;  // NULL => average every sensor
+static gchar *avg_spec = NULL;     // retained window spec, re-parsed on interval change
+static guint n_rows = 0;
+
+static guint avg_count(void) {
+    return avg ? avg->count : 0;
+}
+
+// (Re)build the average windows from the retained spec and current interval.
+static void parse_averages(void) {
+    if (avg)
+        avg_windows_free(avg);
+    avg = avg_windows_parse(avg_spec, refresh_interval_ms);
+}
+
+// Set the initial refresh interval (clamped). Called before start_gui().
+void gui_set_interval(guint ms) {
+    if (ms < MIN_INTERVAL_MS)
+        ms = MIN_INTERVAL_MS;
+    if (ms > MAX_INTERVAL_MS)
+        ms = MAX_INTERVAL_MS;
+    refresh_interval_ms = ms;
+}
+
+// Retain the window spec (e.g. "30s,1m,5m"); parsing happens in start_gui once
+// the interval is known. NULL/empty leaves averaging disabled.
+void gui_set_averages(const gchar *spec) {
+    g_free(avg_spec);
+    avg_spec = (spec && *spec) ? g_strdup(spec) : NULL;
+}
+
+// Restrict which sensors get averaged to those whose label contains one of the
+// given comma-separated substrings. NULL/empty averages every sensor.
+void gui_set_average_filter(const gchar *spec) {
+    str_filter_free(avg_filter);
+    avg_filter = str_filter_parse(spec);
+}
+
+static guint window_width(void) {
+    return 500 + avg_count() * 100;
+}
 
 static void init_sensors() {
     GtkTreeIter iter;
@@ -25,7 +82,7 @@ static void init_sensors() {
     GtkListStore *store;
     SensorSource *source;
     const SensorInit *data;
-    guint i = 0;
+    guint i = 0, k;
 
     store = GTK_LIST_STORE(model);
     for (source = sensor_sources; source->drv; source++) {
@@ -45,9 +102,33 @@ static void init_sensors() {
                                        COLUMN_MIN,   " --- ",
                                        COLUMN_MAX,   " --- ",
                                        -1);
+                    for (k = 0; k < avg_count(); k++)
+                        gtk_list_store_set(store, &iter, COLUMN_AVG_BASE + k, " --- ", -1);
                     sensor = sensor->next;
                     i++;
                 }
+            }
+        }
+    }
+
+    // Allocate per-row history once we know how many rows exist. A second pass
+    // (same iteration order) decides, per row, whether it is averaged, and only
+    // those rows get a ring buffer allocated.
+    n_rows = i;
+    if (avg_count() > 0 && n_rows > 0) {
+        guint r = 0;
+        series = g_new0(AvgSeries, n_rows);
+        row_avg = g_new0(gboolean, n_rows);
+
+        for (source = sensor_sources; source->drv; source++) {
+            if (!source->enabled)
+                continue;
+            for (sensor = source->sensors; sensor; sensor = sensor->next) {
+                data = (SensorInit *)sensor->data;
+                row_avg[r] = str_filter_match(avg_filter, data->label);
+                if (row_avg[r])
+                    avg_series_init(&series[r], avg);
+                r++;
             }
         }
     }
@@ -55,7 +136,15 @@ static void init_sensors() {
 
 static GtkTreeModel* create_model (void) {
     GtkListStore *store;
-    store = gtk_list_store_new (NUM_COLUMNS, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    guint n_columns = COLUMN_AVG_BASE + avg_count();
+    GType *types = g_new(GType, n_columns);
+    guint c;
+
+    for (c = 0; c < n_columns; c++)
+        types[c] = G_TYPE_STRING;
+
+    store = gtk_list_store_newv(n_columns, types);
+    g_free(types);
     return GTK_TREE_MODEL (store);
 }
 
@@ -69,22 +158,45 @@ static void set_list_column_value(float num, const gchar *printf_format, GtkTree
     g_free(value);
 }
 
+// Push a fresh reading into a row's history and refresh its average columns.
+static void update_averages(guint row, float value, const gchar *printf_format, GtkTreeIter *iter) {
+    guint k;
+
+    if (avg_count() == 0 || row >= n_rows || !row_avg[row])
+        return;
+
+    avg_series_push(&series[row], avg, value);
+    if (!series[row].valid)
+        return;
+
+    for (k = 0; k < avg->count; k++)
+        set_list_column_value((float)series[row].avg[k], printf_format, iter,
+                              COLUMN_AVG_BASE + k);
+}
+
 static gboolean update_data (gpointer data) {
     GtkTreeIter iter;
     GSList *node;
     SensorSource *source;
     const SensorInit *sensorData;
+    guint row = 0;
 
-    if (model == NULL)
+    // On self-removal, clear the stored ID so apply_interval() won't
+    // g_source_remove() a source that no longer exists.
+    if (model == NULL) {
+        timeout = 0;
         return G_SOURCE_REMOVE;
+    }
 
-    if (!gtk_tree_model_get_iter_first (model, &iter))
+    if (!gtk_tree_model_get_iter_first (model, &iter)) {
+        timeout = 0;
         return G_SOURCE_REMOVE;
+    }
 
     for (source = sensor_sources; source->drv; source++) {
         if (!source->enabled)
             continue;
-            
+
         source->func_update();
         if (source->sensors){
             node = source->sensors;
@@ -94,7 +206,9 @@ static gboolean update_data (gpointer data) {
                 set_list_column_value(*(sensorData->value), sensorData->printf_format, &iter, COLUMN_VALUE);
                 set_list_column_value(*(sensorData->min), sensorData->printf_format, &iter, COLUMN_MIN);
                 set_list_column_value(*(sensorData->max), sensorData->printf_format, &iter, COLUMN_MAX);
+                update_averages(row, *(sensorData->value), sensorData->printf_format, &iter);
 
+                row++;
                 node = node->next;
                 if (!gtk_tree_model_iter_next(model, &iter))
                     break;
@@ -104,46 +218,33 @@ static gboolean update_data (gpointer data) {
     return G_SOURCE_CONTINUE;
 }
 
-static void add_columns (GtkTreeView *treeview) {
+static void append_text_column(GtkTreeView *treeview, const gchar *title, gint column) {
     GtkCellRenderer *renderer;
-    GtkTreeViewColumn *column;
+    GtkTreeViewColumn *col;
 
-    // NAME
     renderer = gtk_cell_renderer_text_new ();
-    column = gtk_tree_view_column_new_with_attributes ("Sensor", renderer,
-                                                     "text", COLUMN_NAME,
-                                                     NULL);
+    col = gtk_tree_view_column_new_with_attributes (title, renderer,
+                                                    "text", column,
+                                                    NULL);
     g_object_set(renderer, "family", "monotype", NULL);
-    gtk_tree_view_append_column (treeview, column);
+    gtk_tree_view_append_column (treeview, col);
+}
 
-    //VALUE
-    renderer = gtk_cell_renderer_text_new ();
-    column = gtk_tree_view_column_new_with_attributes ("Value", renderer,
-                                                     "text", COLUMN_VALUE,
-                                                     NULL);
-    g_object_set(renderer, "family", "monotype", NULL);
-    gtk_tree_view_append_column (treeview, column);
+static void add_columns (GtkTreeView *treeview) {
+    guint k;
 
-    //MIN
-    renderer = gtk_cell_renderer_text_new ();
-    column = gtk_tree_view_column_new_with_attributes ("Min", renderer,
-                                                     "text", COLUMN_MIN,
-                                                     NULL);
-    g_object_set(renderer, "family", "monotype", NULL);
-    gtk_tree_view_append_column (treeview, column);
+    append_text_column(treeview, "Sensor", COLUMN_NAME);
+    append_text_column(treeview, "Value", COLUMN_VALUE);
+    append_text_column(treeview, "Min", COLUMN_MIN);
+    append_text_column(treeview, "Max", COLUMN_MAX);
 
-    //MAX
-    renderer = gtk_cell_renderer_text_new ();
-    column = gtk_tree_view_column_new_with_attributes ("Max", renderer,
-                                                     "text", COLUMN_MAX,
-                                                     NULL);
-    g_object_set(renderer, "family", "monotype", NULL);
-    gtk_tree_view_append_column (treeview, column);
+    for (k = 0; k < avg_count(); k++)
+        append_text_column(treeview, avg->titles[k], COLUMN_AVG_BASE + k);
 }
 
 static void about_btn_clicked(GtkButton *button, gpointer user_data) {
     GtkWidget *dialog;
-    const gchar *website = "https://github.com/ocerman/zenmonitor";
+    const gchar *website = "https://github.com/HonsW/zenmonitor";
     const gchar *msg = "<b>Zen Monitor</b> %s\n"
                        "Monitoring software for AMD Zen-based CPUs\n"
                        "<a href=\"%s\">%s</a>\n\n"
@@ -167,6 +268,72 @@ static void clear_btn_clicked(GtkButton *button, gpointer user_data) {
 
         source->func_clear_minmax();
     }
+}
+
+// Re-parse the average windows for the new interval and reset every averaged
+// row's history (samples taken at different cadences can't share a window).
+static void reset_averages(void) {
+    GtkTreeIter iter;
+    guint r = 0, k;
+
+    if (avg_count() == 0)
+        return;
+
+    parse_averages();
+
+    if (!series || !gtk_tree_model_get_iter_first(model, &iter))
+        return;
+
+    do {
+        if (r < n_rows && row_avg[r]) {
+            avg_series_free(&series[r]);
+            avg_series_init(&series[r], avg);
+            for (k = 0; k < avg->count; k++)
+                gtk_list_store_set(GTK_LIST_STORE(model), &iter,
+                                   COLUMN_AVG_BASE + k, " --- ", -1);
+        }
+        r++;
+    } while (gtk_tree_model_iter_next(model, &iter));
+}
+
+static void apply_interval(guint ms) {
+    if (ms == refresh_interval_ms)
+        return;
+
+    refresh_interval_ms = ms;
+    reset_averages();       // rescale windows and restart the average history
+
+    // Reschedule only if monitoring is actually running (timeout is 0 when no
+    // Zen CPU was detected and sensors were never initialised).
+    if (timeout) {
+        g_source_remove(timeout);
+        timeout = g_timeout_add(refresh_interval_ms, update_data, NULL);
+    }
+}
+
+static void interval_btn_clicked(GtkButton *button, gpointer user_data) {
+    GtkWidget *dialog, *content, *box, *label, *spin;
+
+    dialog = gtk_dialog_new_with_buttons("Update Interval", GTK_WINDOW(window),
+                                         GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                         "_Cancel", GTK_RESPONSE_CANCEL,
+                                         "_OK", GTK_RESPONSE_OK, NULL);
+    content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+
+    box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+    label = gtk_label_new("Update interval (ms):");
+    spin = gtk_spin_button_new_with_range(MIN_INTERVAL_MS, MAX_INTERVAL_MS, 50);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), refresh_interval_ms);
+    gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), spin, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(content), box);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK)
+        apply_interval((guint)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spin)));
+
+    gtk_widget_destroy(dialog);
 }
 
 static gboolean mid_search_eq_func(GtkTreeModel *model, gint column, const gchar *key, GtkTreeIter *iter) {
@@ -201,12 +368,13 @@ static void resize_to_treeview(GtkWindow* window, GtkTreeView* treeview) {
     gtk_tree_view_get_visible_rect(treeview, &r);
     uiHeight = defaultHeight - r.height;
 
-    gtk_window_resize(window, 500, uiHeight + (vSeparator + cellHeight) * rows);
+    gtk_window_resize(window, window_width(), uiHeight + (vSeparator + cellHeight) * rows);
 }
 
 int start_gui (SensorSource *ss) {
     GtkWidget *about_btn;
     GtkWidget *clear_btn;
+    GtkWidget *interval_btn;
     GtkWidget *box;
     GtkWidget *header;
     GtkWidget *treeview;
@@ -216,14 +384,16 @@ int start_gui (SensorSource *ss) {
 
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER);
-    gtk_window_set_default_size(GTK_WINDOW(window), 500, defaultHeight);
+    gtk_window_set_default_size(GTK_WINDOW(window), window_width(), defaultHeight);
 
+    gchar *cpu_model_str = cpu_model();
     header = gtk_header_bar_new();
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR (header), TRUE);
     gtk_header_bar_set_title(GTK_HEADER_BAR (header), "Zen monitor");
     gtk_header_bar_set_has_subtitle(GTK_HEADER_BAR (header), TRUE);
-    gtk_header_bar_set_subtitle(GTK_HEADER_BAR (header), cpu_model());
+    gtk_header_bar_set_subtitle(GTK_HEADER_BAR (header), cpu_model_str);
     gtk_window_set_titlebar (GTK_WINDOW (window), header);
+    g_free(cpu_model_str);
 
     box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_style_context_add_class (gtk_widget_get_style_context (box), "linked");
@@ -238,9 +408,15 @@ int start_gui (SensorSource *ss) {
     gtk_container_add(GTK_CONTAINER(box), clear_btn);
     gtk_widget_set_tooltip_text(clear_btn, "Clear Min/Max");
 
+    interval_btn = gtk_button_new();
+    gtk_container_add(GTK_CONTAINER(interval_btn), gtk_image_new_from_icon_name("preferences-system", GTK_ICON_SIZE_BUTTON));
+    gtk_container_add(GTK_CONTAINER(box), interval_btn);
+    gtk_widget_set_tooltip_text(interval_btn, "Update interval");
+
     gtk_header_bar_pack_start(GTK_HEADER_BAR(header), box);
     g_signal_connect(about_btn, "clicked", G_CALLBACK(about_btn_clicked), NULL);
     g_signal_connect(clear_btn, "clicked", G_CALLBACK(clear_btn_clicked), NULL);
+    g_signal_connect(interval_btn, "clicked", G_CALLBACK(interval_btn_clicked), NULL);
     g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
     vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -251,6 +427,7 @@ int start_gui (SensorSource *ss) {
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW (sw), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_box_pack_start(GTK_BOX (vbox), sw, TRUE, TRUE, 0);
 
+    parse_averages();   // build windows from the spec + initial interval
     model = create_model();
     treeview = gtk_tree_view_new_with_model(model);
     gtk_tree_view_set_tooltip_column(GTK_TREE_VIEW(treeview), COLUMN_HINT);
@@ -270,7 +447,7 @@ int start_gui (SensorSource *ss) {
         init_sensors();
 
         resize_to_treeview(GTK_WINDOW(window), GTK_TREE_VIEW(treeview));
-        timeout = g_timeout_add(300, update_data, NULL);
+        timeout = g_timeout_add(refresh_interval_ms, update_data, NULL);
     }
     else{
         dialog = gtk_message_dialog_new(GTK_WINDOW (window),

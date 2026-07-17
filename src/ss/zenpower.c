@@ -4,7 +4,7 @@
 #include "zenmonitor.h"
 #include "zenpower.h"
 
-GSList *zp_sensors = NULL;
+static GSList *zp_sensors = NULL;
 static int nodes = 0;
 
 typedef struct
@@ -82,7 +82,7 @@ static HwmonSensor *hwmon_sensor_new(HwmonSensorType *type, const gchar *dir, gi
     return s;
 }
 
-gboolean zenpower_init() {
+gboolean zenpower_init(void) {
     GDir *hwmon;
     const gchar *entry;
     gchar *name = NULL;
@@ -93,7 +93,8 @@ gboolean zenpower_init() {
         return FALSE;
 
     while ((entry = g_dir_read_name(hwmon))) {
-        read_raw_hwmon_value(entry, "name", &name);
+        if (!read_raw_hwmon_value(entry, "name", &name))
+            continue;
 
         if (strcmp(g_strchomp(name), "zenpower") == 0) {
 
@@ -106,6 +107,7 @@ gboolean zenpower_init() {
 
         }
         g_free(name);
+        name = NULL;
     }
 
     if (zp_sensors == NULL)
@@ -114,7 +116,7 @@ gboolean zenpower_init() {
     return TRUE;
 }
 
-void zenpower_update() {
+void zenpower_update(void) {
     gchar *tmp = NULL;
     GSList *node;
     HwmonSensor *sensor;
@@ -141,7 +143,7 @@ void zenpower_update() {
     }
 }
 
-void zenpower_clear_minmax() {
+void zenpower_clear_minmax(void) {
     HwmonSensor *sensor;
     GSList *node;
     node = zp_sensors;
@@ -153,7 +155,7 @@ void zenpower_clear_minmax() {
     }
 }
 
-GSList* zenpower_get_sensors() {
+GSList* zenpower_get_sensors(void) {
     GSList *list = NULL;
     HwmonSensor *sensor;
     GSList *node;

@@ -1,4 +1,4 @@
-gboolean zenpower_init();
-GSList* zenpower_get_sensors();
-void zenpower_update();
-void zenpower_clear_minmax();
+gboolean zenpower_init(void);
+GSList* zenpower_get_sensors(void);
+void zenpower_update(void);
+void zenpower_clear_minmax(void);
